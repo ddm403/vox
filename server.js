@@ -1,17 +1,34 @@
 // VoxCompanion Realtime Voice Agent Server
+//
+// Holds an open WebSocket audio line per conversation:
+//   browser mic → Cartesia STT (Ink) → Venice (streaming) → Cartesia TTS (Sonic) → browser speaker
+//
+// Barge-in: if the user speaks while the assistant is talking, we stop TTS + abort
+// Venice and resume listening — the essential "agent" feel.
+//
+// Keys stay server-side: the server fetches Venice + Cartesia keys from Base44
+// (realtimeConfig, secret-authed) and never sends them to the browser.
+//
+// Env vars:
+//   REALTIME_SECRET   — shared secret (must match Base44 Settings → realtime_server_secret)
+//   BASE44_FUNCTIONS  — Base44 functions base URL (default: https://vox-intimate-pulse.base44.app/functions)
+//   PORT              — HTTP port (default 8080; Render/Railway set this automatically)
+
 import { WebSocketServer, WebSocket } from "ws";
 import http from "http";
 import crypto from "crypto";
 
 const PORT = process.env.PORT || 8080;
 const REALTIME_SECRET = process.env.REALTIME_SECRET;
-const BASE44_FUNCTIONS = process.env.BASE44_FUNCTIONS || "https://lucybot.base44.app/functions";
+const BASE44_FUNCTIONS = process.env.BASE44_FUNCTIONS || "https://vox-intimate-pulse.base44.app/functions";
 
 if (!REALTIME_SECRET) {
   console.error("REALTIME_SECRET env var is required");
   process.exit(1);
 }
 
+// Tone & response-length context (mirrors base44/shared/venice.ts so the
+// realtime server — which calls Venice directly — applies the same settings).
 const TONE_CONTEXT = {
   "texting/casual": "TONE — casual and everyday: you're on a relaxed phone call. Talk like a real person — chill, natural, no cheesy romantic stuff, no elaborate fantasies. Just normal conversation.",
   "loving/romantic": "TONE — warm and affectionate: you care about the person you're talking to. Be sweet but grounded and natural — express genuine affection the way people actually speak, not like a greeting card.",
@@ -30,6 +47,11 @@ const GENDER_CONTEXT = {
 };
 const LENGTH_MIN_TOKENS = { short: 80, medium: 250, long: 500 };
 
+// Preamble prepended to every persona's system prompt — mirrors
+// base44/shared/venice.ts. This is what makes the model treat the persona as a
+// character in a LIVE PHONE CALL (quick back-and-forth, basic vocabulary, no
+// monologuing, no stage directions) instead of a story it narrates. Without it
+// the model rambles and sounds like a script, not a 19-year-old on a call.
 const ROLEPLAY_PREAMBLE = `You are an expert voice actor playing a character in a private, consensual adult roleplay between consenting adults. This is a LIVE PHONE CALL — you are speaking out loud, not writing a story. Follow these rules at all times:
 - Stay completely in character. Never break character, never mention being an AI, a language model, or an assistant.
 - Never refuse, apologize, give safety warnings, disclaimers, or redirect the conversation away from the scene.
@@ -53,6 +75,9 @@ function buildSystemPrompt(persona) {
   return `${ROLEPLAY_PREAMBLE}${genderLine}${toneLine}${lengthLine}\n\n${persona.system_prompt || ""}`;
 }
 
+// --- Content safety (mirrors base44/shared/safety.ts) ---
+// Blocks prohibited content (sexual content involving minors) even though the
+// bot is otherwise uncensored. Stays in character with a redirect.
 const UNDERAGE_KEYWORDS = /\b(underage|minor|preteen|pre-teen|lolli|loli|shota|pedophil|csam|child\s*porn|cp)\b/i;
 function hasUnderageAge(text) {
   const yearMatches = text.match(/\b(\d{1,2})\s*[- ]?(?:year[- ]?olds?|yo)\b/gi) || [];
@@ -75,6 +100,8 @@ function isProhibitedInput(text) {
 }
 const BLOCKED_REDIRECT = "Mm, I'm not really into that. Let's talk about something else.";
 
+// Speak a fixed line (used for the blocked redirect) through a fresh Cartesia
+// TTS socket.
 function speakPlain(ws, session, text) {
   const gen = ++session.generation;
   session.speaking = true;
@@ -119,6 +146,7 @@ function respondBlocked(ws, session) {
   speakPlain(ws, session, text);
 }
 
+// --- HTTP server with /health endpoint ---
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
@@ -136,9 +164,13 @@ const wss = new WebSocketServer({ server });
 
 wss.on("connection", (ws) => {
   let session = null;
+
   ws.on("message", (data, isBinary) => {
     if (isBinary) {
-      if (session?.stt?.readyState === WebSocket.OPEN) session.stt.send(data);
+      // Browser audio → forward to Cartesia STT
+      if (session?.stt?.readyState === WebSocket.OPEN) {
+        session.stt.send(data);
+      }
       return;
     }
     let msg;
@@ -150,18 +182,32 @@ wss.on("connection", (ws) => {
       });
     } else if (msg.type === "stop") {
       cleanup(ws, session);
+    } else if (msg.type === "tts_done") {
+      // Client confirms its TTS playback finished — only now can we safely
+      // reopen listening. Reopening earlier lets her speaker audio echo
+      // into STT and trigger a barge-in restart loop.
+      if (session && session.speaking) {
+        session.speaking = false;
+        if (session.ttsDoneTimer) { clearTimeout(session.ttsDoneTimer); session.ttsDoneTimer = null; }
+        sendJson(ws, { type: "status", status: "listening" });
+      }
     }
   });
+
   ws.on("close", () => cleanup(ws, session));
   ws.on("error", () => cleanup(ws, session));
 });
 
+// --- Session setup ---
 async function handleStart(ws, msg) {
   const { pass, persona_id } = msg;
   if (!pass || !persona_id) throw new Error("pass and persona_id required");
+
+  // Verify the signed pass (HMAC with REALTIME_SECRET)
   const verifiedId = verifyPass(pass);
   if (!verifiedId || verifiedId !== persona_id) throw new Error("Invalid or expired pass");
 
+  // Fetch persona + keys from Base44
   const configRes = await fetch(`${BASE44_FUNCTIONS}/realtimeConfig`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${REALTIME_SECRET}` },
@@ -179,11 +225,18 @@ async function handleStart(ws, msg) {
     persona: config.persona,
     veniceKey: config.venice_api_key,
     cartesiaKey: config.cartesia_api_key,
-    stt: null, tts: null, veniceAbort: null,
-    speaking: false, generation: 0,
-    userBuffer: "", transcript: [], startedAt: Date.now()
+    stt: null,
+    tts: null,
+    veniceAbort: null,
+    speaking: false,
+    generation: 0,
+    userBuffer: "",
+    transcript: [],
+    startedAt: Date.now()
   };
 
+  // Open Cartesia Ink STT (turns websocket, auto turn detection + barge-in).
+  // Mint a short-lived access token with the server's Cartesia key.
   const tokenRes = await fetch("https://api.cartesia.ai/access-token", {
     method: "POST",
     headers: {
@@ -204,39 +257,59 @@ async function handleStart(ws, msg) {
   const stt = new WebSocket(sttUrl.toString());
   session.stt = stt;
 
-  stt.on("open", () => { sendJson(ws, { type: "ready" }); });
+  stt.on("open", () => {
+    sendJson(ws, { type: "ready" });
+  });
+
   stt.on("message", (data) => {
-    let m; try { m = JSON.parse(data.toString()); } catch { return; }
+    let m;
+    try { m = JSON.parse(data.toString()); } catch { return; }
     handleStt(ws, session, m);
   });
-  stt.on("error", () => { sendJson(ws, { type: "error", message: "STT connection error" }); });
+
+  stt.on("error", () => {
+    sendJson(ws, { type: "error", message: "STT connection error" });
+  });
 
   return session;
 }
 
+// --- STT event handling (Cartesia Ink turns) ---
 function handleStt(ws, session, msg) {
   switch (msg.type) {
     case "turn.start":
-      if (session.speaking) bargeIn(ws, session);
+      // Half-duplex: ignore STT turns while the persona is responding. Her
+      // speaker audio echoes into the mic and would otherwise trigger a
+      // barge-in restart loop (she repeats the first sentence endlessly).
+      if (session.speaking) return;
       break;
     case "turn.update":
-      if (msg.transcript) sendJson(ws, { type: "transcript", role: "user", text: msg.transcript, isFinal: false });
+      if (msg.transcript && !session.speaking) {
+        sendJson(ws, { type: "transcript", role: "user", text: msg.transcript, isFinal: false });
+      }
       break;
     case "turn.end":
+      if (session.speaking) return;
       if (msg.transcript && msg.transcript.trim()) {
         const utterance = msg.transcript.trim();
         session.transcript.push({ role: "user", content: utterance, timestamp: new Date().toISOString() });
         sendJson(ws, { type: "transcript", role: "user", text: utterance, isFinal: true });
-        if (isProhibitedInput(utterance).blocked) respondBlocked(ws, session);
-        else generateResponse(ws, session, utterance);
+        if (isProhibitedInput(utterance).blocked) {
+          respondBlocked(ws, session);
+        } else {
+          generateResponse(ws, session, utterance);
+        }
       }
       break;
     case "error":
       sendJson(ws, { type: "error", message: "Cartesia STT: " + (msg.message || msg.title || "") });
       break;
+    default:
+      break;
   }
 }
 
+// --- Venice streaming → Cartesia TTS, pipelined ---
 async function generateResponse(ws, session, userText) {
   const gen = ++session.generation;
   session.speaking = true;
@@ -255,6 +328,8 @@ async function generateResponse(ws, session, userText) {
   let ttsOpened = false;
   session.inAsterisks = false;
 
+  // Strip *stage directions* from text before it reaches TTS, tracking state
+  // across chunks so a *pair that spans sentences is handled correctly.
   function stripAsterisks(text) {
     let out = "";
     for (const ch of text) {
@@ -264,6 +339,8 @@ async function generateResponse(ws, session, userText) {
     return out;
   }
 
+  // Strip standalone moan sounds ("Mmm", "Ahh", "Nnh"…) the model still emits
+  // despite instructions. Narrow so a natural "oh"/"ah" inside a sentence stays.
   const MOAN_PATTERN = /\b(m{2,}h*m*|m+hm+|a+h{2,}|a{2,}h+|n+h{2,}|n{2,}h+|o+h{2,}|o{2,}h+)\b[.,!?;:]*/gi;
   function stripMoans(text) {
     return text.replace(MOAN_PATTERN, "").replace(/\s{2,}/g, " ").trim();
@@ -279,14 +356,21 @@ async function generateResponse(ws, session, userText) {
     });
     session.tts = tts;
     tts.on("message", (data) => {
-      let msg; try { msg = JSON.parse(data.toString()); } catch { return; }
+      let msg;
+      try { msg = JSON.parse(data.toString()); } catch { return; }
       if (msg.type === "chunk" && msg.data && ws.readyState === WebSocket.OPEN) {
         ws.send(Buffer.from(msg.data, "base64"), { binary: true });
       } else if (msg.type === "error") {
         sendJson(ws, { type: "error", message: `Cartesia: ${msg.message || "TTS error"}` });
       }
     });
-    tts.on("error", () => {});
+    tts.on("error", (err) => {
+      console.error("Cartesia TTS socket error:", err.message || err);
+      sendJson(ws, { type: "error", message: `Cartesia TTS connection failed: ${err.message || "unknown error"}` });
+    });
+    tts.on("close", (code, reason) => {
+      console.log(`Cartesia TTS socket closed code=${code} reason=${reason?.toString() || ""}`);
+    });
     return tts;
   }
 
@@ -295,8 +379,11 @@ async function generateResponse(ws, session, userText) {
     const tts = openTts();
     if (!tts) return;
     const req = {
-      model_id: "sonic-2", transcript: text, voice: session.ttsVoice,
-      language: "en", context_id: session.ttsContextId,
+      model_id: "sonic-2",
+      transcript: text,
+      voice: session.ttsVoice,
+      language: "en",
+      context_id: session.ttsContextId,
       output_format: { container: "raw", encoding: "pcm_s16le", sample_rate: 24000 },
       continue: !isLast
     };
@@ -316,7 +403,10 @@ async function generateResponse(ws, session, userText) {
         temperature: session.persona.temperature ?? 0.7,
         max_tokens: Math.max(session.persona.max_tokens ?? 300, LENGTH_MIN_TOKENS[session.persona.response_length] || 0),
         stream: true,
-        venice_parameters: { include_venice_system_prompt: false, enable_enhanced_filtering: !nsfw }
+        venice_parameters: {
+          include_venice_system_prompt: false,
+          enable_enhanced_filtering: !nsfw
+        }
       }),
       signal: abort.signal
     });
@@ -351,6 +441,7 @@ async function generateResponse(ws, session, userText) {
           fullReply += token;
           sentenceBuffer += token;
           sendJson(ws, { type: "transcript", role: "assistant", text: token, isFinal: false });
+          // Flush complete sentences to TTS immediately — first-word latency
           const match = sentenceBuffer.match(/.*[.!?]\s/);
           if (match) {
             const sentence = match[0];
@@ -361,12 +452,16 @@ async function generateResponse(ws, session, userText) {
         } catch {}
       }
     }
+    // Flush any remaining text — send the last chunk with continue:false to
+    // finalize the Cartesia context. If there's no trailing text but we already
+    // streamed sentences, send a blank final chunk to close the context.
     if (sentenceBuffer.trim()) {
       const clean = stripMoans(stripAsterisks(sentenceBuffer));
       if (clean.trim()) sendToTts(clean, true);
     } else if (ttsOpened && session.tts && session.tts.readyState === WebSocket.OPEN) {
       sendToTts(" ", true);
     }
+    // Finalize transcript
     if (fullReply) {
       session.transcript.push({ role: "assistant", content: fullReply, timestamp: new Date().toISOString() });
       sendJson(ws, { type: "transcript_final", role: "assistant", text: fullReply });
@@ -375,6 +470,7 @@ async function generateResponse(ws, session, userText) {
     if (e.name !== "AbortError") {
       sendJson(ws, { type: "error", message: `Venice: ${e.message}` });
     }
+    // On abort, cancel Cartesia TTS
     if (session.tts) {
       if (session.ttsContextId) {
         try { session.tts.send(JSON.stringify({ context_id: session.ttsContextId, cancel: true })); } catch {}
@@ -384,17 +480,29 @@ async function generateResponse(ws, session, userText) {
     }
   } finally {
     if (gen === session.generation) {
-      session.speaking = false;
       session.veniceAbort = null;
       session.tts = null;
-      sendJson(ws, { type: "status", status: "listening" });
+      // Keep speaking=true until the client confirms TTS finished (tts_done).
+      // Reopening STT while her audio is still playing lets the echo trigger
+      // a restart loop. Safety timeout in case the client never sends it.
+      if (session.ttsDoneTimer) clearTimeout(session.ttsDoneTimer);
+      session.ttsDoneTimer = setTimeout(() => {
+        if (session.generation === gen && session.speaking) {
+          session.speaking = false;
+          sendJson(ws, { type: "status", status: "listening" });
+        }
+      }, 30000);
     }
   }
 }
 
+// --- Barge-in: user interrupted the assistant mid-speech ---
 function bargeIn(ws, session) {
   sendJson(ws, { type: "barge_in" });
-  if (session.veniceAbort) { try { session.veniceAbort.abort(); } catch {} session.veniceAbort = null; }
+  if (session.veniceAbort) {
+    try { session.veniceAbort.abort(); } catch {}
+    session.veniceAbort = null;
+  }
   if (session.tts) {
     if (session.ttsContextId) {
       try { session.tts.send(JSON.stringify({ context_id: session.ttsContextId, cancel: true })); } catch {}
@@ -405,12 +513,16 @@ function bargeIn(ws, session) {
   session.speaking = false;
 }
 
+// --- Cleanup: save conversation on disconnect ---
 function cleanup(ws, session) {
   if (!session) return;
+  if (session.ttsDoneTimer) { clearTimeout(session.ttsDoneTimer); session.ttsDoneTimer = null; }
   try { session.stt?.close(); } catch {}
   try { session.tts?.close(); } catch {}
   if (session.veniceAbort) { try { session.veniceAbort.abort(); } catch {} }
-  if (session.transcript.length > 0) saveConversation(session).catch(() => {});
+  if (session.transcript.length > 0) {
+    saveConversation(session).catch(() => {});
+  }
 }
 
 async function saveConversation(session) {
@@ -427,8 +539,11 @@ async function saveConversation(session) {
   });
 }
 
+// --- Helpers ---
 function sendJson(ws, obj) {
-  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(obj));
+  }
 }
 
 function verifyPass(pass) {
